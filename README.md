@@ -17,6 +17,8 @@ My data engineering experience has been primarily on Azure — building multi-ag
 | 1 | `01_streams_and_tasks.sql` | CDC, Streams, Tasks, MERGE idempotency |
 | 2 | `02_rbac.sql` | Role hierarchy, least privilege, governance |
 | 3 | `03_clustering.sql` | Micro-partition pruning, clustering keys, cardinality |
+| 4 | `04_kafka_snowpipe_variant.sql` | Kafka integration, Snowpipe, VARIANT/JSON |
+| 5 | `05_time_travel.sql` | Disaster recovery, AT/BEFORE clause, Fail-Safe |
 
 ---
 
@@ -28,7 +30,7 @@ My data engineering experience has been primarily on Azure — building multi-ag
 
 **What I learned:**
 - A Stream is essentially a changelog on a table — it tracks every INSERT, UPDATE, DELETE with metadata columns (`METADATA$ACTION`, `METADATA$ISUPDATE`, `METADATA$ROW_ID`)
-- Tasks always start **suspended** — you must explicitly `ALTER TASK ... RESUME` or nothing runs
+- Tasks always start **suspended** — you must explicitly `ALTER TASK ... RESUME`
 - After a task processes a stream, the stream returns 0 rows — this is not an error, it means the changes were consumed
 
 **The bug I hit:**
@@ -76,20 +78,60 @@ Snowflake flagged: *"Clustering key columns contain high cardinality key SALE_DA
 **My inference:**
 High cardinality columns (365 distinct dates) force Snowflake to maintain more micro-partitions, making auto-clustering expensive. The fix is to reduce cardinality — `DATE_TRUNC('month', sale_date)` gives 12 values instead of 365. This is the same tradeoff as partition key design in Azure Fabric / Delta Lake — too granular and you pay in overhead, too coarse and pruning doesn't help.
 
-**When NOT to use clustering keys:**
-Small tables, columns with very high cardinality without truncation, or tables with random/unpredictable access patterns. Always validate with `SYSTEM$CLUSTERING_INFORMATION()` before and after.
+---
+
+### Exercise 4 — Kafka + Snowpipe + VARIANT
+
+**What I built:** A simulated Kafka → Snowflake ingestion pipeline using an internal stage, Snowpipe, and a VARIANT column to store raw JSON events.
+
+**What I learned:**
+- The Kafka Connector writes micro-batched JSON files to a Snowflake stage, then Snowpipe auto-ingests them via cloud event notifications
+- `VARIANT` stores JSON natively — no schema definition needed upfront
+- Dot notation extracts nested fields: `payload:amount::FLOAT`
+- `PARSE_JSON()` cannot be used inside a `VALUES` clause — must use `SELECT ... UNION ALL` pattern
+
+**My inference:**
+VARIANT is Snowflake's killer feature for event pipelines. Kafka message schemas evolve constantly — with VARIANT, new fields just appear without any `ALTER TABLE`. Schema-on-read means your ingestion layer never breaks due to upstream schema changes. This is fundamentally different from rigid relational schemas and much closer to how you'd handle events in Azure Event Hubs + Fabric.
+
+**Architecture pattern:**
+```
+Kafka Topic → Kafka Connector → Internal Stage → Snowpipe → events_raw (VARIANT) → Analytics queries
+```
+
+---
+
+### Exercise 5 — Time Travel (Disaster Recovery)
+
+**What I built:** Simulated an accidental `DELETE FROM` on a production table and recovered all data using Snowflake's Time Travel feature.
+
+**What I learned:**
+- Time Travel retains historical data for 1 day (Standard) or up to 90 days (Enterprise)
+- Three ways to specify a point in time: `TIMESTAMP`, `OFFSET` (seconds), or `STATEMENT` (Query ID)
+- `UNDROP TABLE` recovers a dropped table within the retention window
+- Fail-Safe is an additional 7-day period after Time Travel expires — only Snowflake support can access it
+
+**The recovery pattern:**
+```sql
+-- Query historical state
+SELECT * FROM table AT (TIMESTAMP => '...'::TIMESTAMP_TZ);
+
+-- Restore the table
+CREATE OR REPLACE TABLE table AS
+SELECT * FROM table AT (TIMESTAMP => '...'::TIMESTAMP_TZ);
+```
+
+**My inference:**
+Time Travel is operationally transformative — what would normally require a DBA, a backup restore process, and significant downtime is a 2-line SQL operation. The key discipline is capturing timestamps before risky operations. In Azure, equivalent recovery requires point-in-time restore at the database level which is much coarser and slower.
 
 ---
 
 ## 🔑 Key Takeaways
 
-1. **Snowflake vs Azure Fabric** — Both use columnar Lakehouse architectures, but Snowflake separates compute and storage more explicitly. Virtual Warehouses = Spark pools, but fully elastic per query.
-
-2. **Streams are pointers, not copies** — They track offset-like positions on table changes. Once consumed, they reset. Very similar conceptually to Kafka consumer group offsets.
-
-3. **Everything is SQL** — RBAC, clustering, task scheduling, CDC — all done in SQL. No separate orchestration UI needed for basic pipelines.
-
-4. **Idempotency is non-negotiable** — Whether it's Fabric pipelines or Snowflake Tasks, always design for "what happens if this runs twice." MERGE > INSERT.
+1. **Streams are pointers, not copies** — like Kafka consumer group offsets, once consumed they reset to zero
+2. **Always MERGE, never INSERT in Tasks** — idempotency prevents duplicates on retries
+3. **VARIANT = schema-on-read** — future-proof ingestion for evolving event schemas
+4. **Time Travel = SQL-based recovery** — no DBA, no restore process, just AT clause
+5. **Everything is SQL** — RBAC, CDC, ingestion, recovery — all scriptable and auditable
 
 ---
 
